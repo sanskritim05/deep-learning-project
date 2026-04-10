@@ -1,6 +1,19 @@
+"""emotion_modeling_utils_v2.py
+-----------------
+1. EfficientNet-B2 backbone  – stronger feature extractor than ResNet18
+2. Richer data augmentation  – TrivialAugmentWide + RandomErasing + sharper crop/flip
+3. MixUp training            – mixes two random samples per batch to smooth the decision boundary
+4. Label smoothing = 0.1     – reduces over-confidence on a noisy emotion dataset
+5. Cosine Annealing LR       – smoother decay than ReduceLROnPlateau; avoids stalling
+6. Gradient clipping         – prevents exploding gradients during fine-tuning
+7. Test-Time Augmentation    – averages 5 forward passes with random flips/crops at inference
+8. Staged unfreezing         – head → top block → all blocks, each with its own LR
+"""
+
 from __future__ import annotations
 
 import copy
+import os
 import random
 from collections import Counter
 from pathlib import Path
@@ -8,16 +21,17 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
-from torchvision.models import ResNet18_Weights, resnet18
+from torchvision.models import EfficientNet_B2_Weights, efficientnet_b2
 
-
+# ImageNet stats (EfficientNet was trained on ImageNet)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 
+# Reproducibility
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -34,10 +48,11 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+# Dataset helpers
 class TransformSubset(Dataset):
     def __init__(self, dataset, indices, transform=None):
-        self.dataset = dataset
-        self.indices = list(indices)
+        self.dataset   = dataset
+        self.indices   = list(indices)
         self.transform = transform
 
     def __len__(self):
@@ -52,401 +67,387 @@ class TransformSubset(Dataset):
 
 def build_class_weights(targets, num_classes: int) -> torch.Tensor:
     class_counts = Counter(targets)
-    total_samples = sum(class_counts.values())
+    total        = sum(class_counts.values())
     return torch.tensor(
-        [total_samples / class_counts[i] for i in range(num_classes)],
+        [total / class_counts[i] for i in range(num_classes)],
         dtype=torch.float32,
     )
 
 
 def _make_split_indices(dataset_size: int, val_ratio: float, seed: int):
-    generator = torch.Generator().manual_seed(seed)
-    indices = torch.randperm(dataset_size, generator=generator).tolist()
+    generator  = torch.Generator().manual_seed(seed)
+    indices    = torch.randperm(dataset_size, generator=generator).tolist()
     train_size = int((1.0 - val_ratio) * dataset_size)
     return indices[:train_size], indices[train_size:]
 
 
-def _build_common_metadata(base_train_dataset, train_indices, val_indices, class_weights):
+def _build_common_metadata(base_train, train_idx, val_idx, class_weights):
     return {
-        "idx_to_class": {idx: name for idx, name in enumerate(base_train_dataset.classes)},
-        "class_to_idx": base_train_dataset.class_to_idx,
+        "idx_to_class":  {i: n for i, n in enumerate(base_train.classes)},
+        "class_to_idx":  base_train.class_to_idx,
         "class_weights": class_weights,
-        "num_classes": len(base_train_dataset.classes),
-        "train_size": len(train_indices),
-        "val_size": len(val_indices),
-        "class_counts": Counter(base_train_dataset.targets),
+        "num_classes":   len(base_train.classes),
+        "train_size":    len(train_idx),
+        "val_size":      len(val_idx),
+        "class_counts":  Counter(base_train.targets),
     }
 
 
-def prepare_cnn_dataloaders(
-    train_dir: str | Path = "archive/train",
-    test_dir: str | Path = "archive/test",
-    batch_size: int = 64,
-    val_ratio: float = 0.2,
-    image_size: int = 48,
-    seed: int = 42,
+# Stronger augmentation pipeline
+def prepare_efficientnet_dataloaders(
+    train_dir:  str | Path = "archive/train",
+    test_dir:   str | Path = "archive/test",
+    batch_size: int        = 32,          # EfficientNet-B2 needs more memory
+    val_ratio:  float      = 0.2,
+    image_size: int        = 260,         # native resolution for B2
+    seed:       int        = 42,
 ):
-    train_transform = transforms.Compose(
-        [
-            transforms.Grayscale(num_output_channels=1),
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,)),
-        ]
-    )
+    """
+    Dataloaders tuned for EfficientNet-B2.
 
-    eval_transform = transforms.Compose(
-        [
-            transforms.Grayscale(num_output_channels=1),
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,)),
-        ]
-    )
+    Training augmentations (change 2):
+    - TrivialAugmentWide  : randomly applies one of ~30 distortions per batch
+    - RandomHorizontalFlip: faces are roughly symmetric
+    - RandomResizedCrop   : forces the model to use partial face cues
+    - ColorJitter         : handles lighting variation
+    - RandomErasing       : randomly masks a patch → forces learning from context
+    """
+    train_transform = transforms.Compose([
+        transforms.Grayscale(num_output_channels=3),          # grayscale → 3-ch copy
+        transforms.Resize((image_size + 20, image_size + 20)),
+        transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.TrivialAugmentWide(),                       # NEW
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),  # STRONGER
+    ])
 
-    base_train_dataset = datasets.ImageFolder(train_dir)
-    test_dataset = datasets.ImageFolder(test_dir, transform=eval_transform)
+    eval_transform = transforms.Compose([
+        transforms.Grayscale(num_output_channels=3),
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
 
-    train_indices, val_indices = _make_split_indices(len(base_train_dataset), val_ratio, seed)
-    train_dataset = TransformSubset(base_train_dataset, train_indices, transform=train_transform)
-    val_dataset = TransformSubset(base_train_dataset, val_indices, transform=eval_transform)
+    base_train = datasets.ImageFolder(train_dir)
+    test_ds    = datasets.ImageFolder(test_dir, transform=eval_transform)
 
-    class_weights = build_class_weights(base_train_dataset.targets, len(base_train_dataset.classes))
+    train_idx, val_idx = _make_split_indices(len(base_train), val_ratio, seed)
+    train_ds = TransformSubset(base_train, train_idx, transform=train_transform)
+    val_ds   = TransformSubset(base_train, val_idx,   transform=eval_transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    class_weights = build_class_weights(base_train.targets, len(base_train.classes))
 
-    metadata = _build_common_metadata(base_train_dataset, train_indices, val_indices, class_weights)
-    metadata.update(
-        {
-            "train_loader": train_loader,
-            "val_loader": val_loader,
-            "test_loader": test_loader,
-        }
-    )
-    return metadata
+    # pin_memory speeds up CPU→GPU transfers on CUDA.
+    # persistent_workers avoids restarting worker processes each epoch.
+    # dynamic num_workers — MPS is unstable with many workers; CUDA benefits from more.
+    pin_memory = torch.cuda.is_available()
+    num_workers = 0 if torch.backends.mps.is_available() else min(8, os.cpu_count() or 4)
+    persistent = num_workers > 0
 
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=pin_memory,
+                              persistent_workers=persistent)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=pin_memory,
+                              persistent_workers=persistent)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=pin_memory,
+                              persistent_workers=persistent)
 
-def prepare_transfer_dataloaders(
-    train_dir: str | Path = "archive/train",
-    test_dir: str | Path = "archive/test",
-    batch_size: int = 64,
-    val_ratio: float = 0.2,
-    image_size: int = 224,
-    seed: int = 42,
-):
-    train_transform = transforms.Compose(
-        [
-            transforms.Grayscale(num_output_channels=3),
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.15, contrast=0.15),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-            transforms.RandomErasing(p=0.25, scale=(0.02, 0.12), ratio=(0.3, 3.3)),
-        ]
-    )
-
-    eval_transform = transforms.Compose(
-        [
-            transforms.Grayscale(num_output_channels=3),
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ]
-    )
-
-    base_train_dataset = datasets.ImageFolder(train_dir)
-    test_dataset = datasets.ImageFolder(test_dir, transform=eval_transform)
-
-    train_indices, val_indices = _make_split_indices(len(base_train_dataset), val_ratio, seed)
-    train_dataset = TransformSubset(base_train_dataset, train_indices, transform=train_transform)
-    val_dataset = TransformSubset(base_train_dataset, val_indices, transform=eval_transform)
-
-    class_weights = build_class_weights(base_train_dataset.targets, len(base_train_dataset.classes))
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=torch.cuda.is_available(),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=torch.cuda.is_available(),
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    metadata = _build_common_metadata(base_train_dataset, train_indices, val_indices, class_weights)
-    metadata.update(
-        {
-            "train_loader": train_loader,
-            "val_loader": val_loader,
-            "test_loader": test_loader,
-        }
-    )
-    return metadata
+    meta = _build_common_metadata(base_train, train_idx, val_idx, class_weights)
+    meta.update({"train_loader": train_loader,
+                 "val_loader":   val_loader,
+                 "test_loader":  test_loader})
+    return meta
 
 
-class BaselineCNN(nn.Module):
-    def __init__(self, num_classes: int):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 12 * 12, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        return self.classifier(x)
-
-
-class ImprovedCNN(nn.Module):
-    def __init__(self, num_classes: int):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Dropout(0.25),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 6 * 6, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        return self.classifier(x)
-
-
-def build_resnet18_transfer_model(
-    num_classes: int,
-    pretrained: bool = True,
+# Change 1: EfficientNet-B2 model builder
+def build_efficientnet_model(
+    num_classes:     int,
+    pretrained:      bool = True,
     freeze_backbone: bool = True,
-    local_weights_path: str | Path | None = "model_weights/resnet18-f37072fd.pth",
-):
-    model = resnet18(weights=None)
-    loaded_pretrained = False
-
-    if pretrained:
-        local_path = Path(local_weights_path) if local_weights_path else None
-        if local_path and local_path.exists():
-            state_dict = torch.load(local_path, map_location="cpu", weights_only=True)
-            model.load_state_dict(state_dict)
-            loaded_pretrained = True
-            print(f"Loaded pretrained weights from local file: {local_path}")
-        else:
-            weights = ResNet18_Weights.DEFAULT
-            try:
-                model = resnet18(weights=weights)
-                loaded_pretrained = True
-            except Exception as exc:
-                print(f"Could not load pretrained weights, falling back to random init: {exc}")
+) -> nn.Module:
+    """
+    EfficientNet-B2 is roughly 3× more parameter-efficient than ResNet18 while
+    achieving significantly higher ImageNet top-1 accuracy.  Its compound scaling
+    (width + depth + resolution) makes it well-suited to fine-grained tasks like
+    facial expression recognition.
+    """
+    weights = EfficientNet_B2_Weights.DEFAULT if pretrained else None
+    model   = efficientnet_b2(weights=weights)
 
     if freeze_backbone:
         for param in model.parameters():
             param.requires_grad = False
 
-    model.fc = nn.Sequential(
-        nn.Dropout(0.4),
-        nn.Linear(model.fc.in_features, num_classes),
+    # Replace the classifier head
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(p=0.4, inplace=True),
+        nn.Linear(in_features, 512),
+        nn.SiLU(),                       # smoother than ReLU for EfficientNet
+        nn.Dropout(p=0.3),
+        nn.Linear(512, num_classes),
     )
 
-    for param in model.fc.parameters():
+    # Always keep classifier trainable
+    for param in model.classifier.parameters():
         param.requires_grad = True
 
-    return model, loaded_pretrained
+    return model
 
 
-def unfreeze_resnet_stage4(model) -> None:
-    for name, param in model.named_parameters():
-        if name.startswith("layer4") or name.startswith("fc"):
+def unfreeze_top_blocks(model: nn.Module, num_blocks: int = 3) -> None:
+    """Unfreeze the last `num_blocks` feature blocks + classifier."""
+    features = list(model.features.children())
+    for block in features[-num_blocks:]:
+        for param in block.parameters():
             param.requires_grad = True
+    for param in model.classifier.parameters():
+        param.requires_grad = True
 
 
-def unfreeze_resnet_stage3_and_4(model) -> None:
-    for name, param in model.named_parameters():
-        if (
-            name.startswith("layer3")
-            or name.startswith("layer4")
-            or name.startswith("fc")
-        ):
-            param.requires_grad = True
+def unfreeze_all(model: nn.Module) -> None:
+    for param in model.parameters():
+        param.requires_grad = True
 
 
-def build_weighted_loss(class_weights: torch.Tensor, device: torch.device, label_smoothing: float = 0.0):
+# MixUp helper
+def mixup_batch(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int,
+    alpha: float = 0.4,
+):
+    """
+    MixUp: creates a convex combination of two random samples.
+    The model is trained on blended images with blended soft labels.
+    This strongly regularises the decision boundary between similar emotions
+    (e.g. fear vs surprise) and consistently improves generalisation.
+
+    Returns (mixed_images, soft_labels_a, soft_labels_b, lam)
+    """
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = images.size(0)
+    index      = torch.randperm(batch_size, device=images.device)
+
+    mixed_images = lam * images + (1 - lam) * images[index]
+
+    # Convert to one-hot for soft mixing
+    one_hot_a = torch.zeros(batch_size, num_classes, device=images.device)
+    one_hot_b = torch.zeros(batch_size, num_classes, device=images.device)
+    one_hot_a.scatter_(1, labels.unsqueeze(1), 1)
+    one_hot_b.scatter_(1, labels[index].unsqueeze(1), 1)
+
+    return mixed_images, one_hot_a, one_hot_b, lam
+
+
+# Loss
+def build_weighted_loss(
+    class_weights:   torch.Tensor,
+    device:          torch.device,
+    label_smoothing: float = 0.1,       #increased from 0.05
+) -> nn.CrossEntropyLoss:
     return nn.CrossEntropyLoss(
         weight=class_weights.to(device),
         label_smoothing=label_smoothing,
     )
 
 
+# Evaluation
 def evaluate_model(model, loader, criterion, device: torch.device):
     model.eval()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    running_loss = correct = total = 0
 
     with torch.no_grad():
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            images, labels = images.to(device), labels.to(device)
+            outputs         = model(images)
+            loss            = criterion(outputs, labels)
 
             running_loss += loss.item() * labels.size(0)
-            preds = outputs.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+            correct      += (outputs.argmax(1) == labels).sum().item()
+            total        += labels.size(0)
 
     return running_loss / total, correct / total
 
 
-def train_model(
+# Test-Time Augmentation
+def evaluate_with_tta(
+    model,
+    loader,
+    criterion,
+    device:    torch.device,
+    tta_n:     int   = 5,
+    image_size: int  = 260,
+):
+    """
+    FIX 4: TTA augmentation now runs entirely on GPU using torchvision functional ops
+    instead of a serial per-image CPU loop. This eliminates the expensive
+    `torch.stack([tta_transform(img.cpu()) for img in images])` bottleneck.
+
+    NOTE: Only call this function at final test time — NOT during per-epoch validation.
+    Use evaluate_model() for validation inside the training loop.
+    """
+    import torchvision.transforms.functional as TF
+
+    model.eval()
+    running_loss = correct = total = 0
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(device), labels.to(device)
+
+            probs = torch.zeros(images.size(0), model.classifier[-1].out_features,
+                                device=device)
+            for _ in range(tta_n):
+                # horizontal flip applied on-GPU as a tensor op (no CPU roundtrip)
+                aug = images.clone()
+                if torch.rand(1).item() > 0.5:
+                    aug = TF.hflip(aug)
+
+                # random crop via affine (stays on GPU)
+                scale = torch.empty(1).uniform_(0.85, 1.0).item()
+                crop_size = int(image_size * scale)
+                aug = TF.center_crop(aug, crop_size)
+                aug = TF.resize(aug, [image_size, image_size], antialias=True)
+
+                probs += torch.softmax(model(aug), dim=1)
+
+            probs /= tta_n
+            preds  = probs.argmax(dim=1)
+
+            loss         = criterion(model(images), labels)
+            running_loss += loss.item() * labels.size(0)
+            correct      += (preds == labels).sum().item()
+            total        += labels.size(0)
+
+    return running_loss / total, correct / total
+
+
+# Training loop with cosine LR + gradient clipping
+def train_model_v2(
     model,
     train_loader,
     val_loader,
     criterion,
     optimizer,
-    device: torch.device,
-    epochs: int,
-    scheduler=None,
-    patience: int | None = None,
+    device:        torch.device,
+    epochs:        int,
+    num_classes:   int,
+    scheduler      = None,
+    patience:      int | None = None,
+    use_mixup:     bool       = True,
+    mixup_alpha:   float      = 0.4,
+    grad_clip:     float      = 1.0,
 ):
-    history = {
-        "train_loss": [],
-        "train_acc": [],
-        "val_loss": [],
-        "val_acc": [],
-        "lr": [],
-    }
-    best_state = copy.deepcopy(model.state_dict())
+    history = {k: [] for k in ("train_loss", "train_acc", "val_loss", "val_acc", "lr")}
+    best_state   = copy.deepcopy(model.state_dict())
     best_val_acc = 0.0
-    best_epoch = 0
-    stale_epochs = 0
+    best_epoch   = 0
+    stale        = 0
+
+    # Automatic Mixed Precision - halves memory bandwidth, uses Tensor Cores on CUDA.
+    # GradScaler is a no-op on CPU/MPS so this is safe across all device types.
+    use_amp = device.type == "cuda"
+    scaler  = GradScaler(enabled=use_amp)
 
     for epoch in range(epochs):
         model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
+        run_loss = correct = total = 0
 
         for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            images, labels = images.to(device), labels.to(device)
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            # zero_grad(set_to_none=True) skips the memset to zero,
+            # which is faster than the default zero_grad().
+            optimizer.zero_grad(set_to_none=True)
 
-            running_loss += loss.item() * labels.size(0)
-            preds = outputs.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+            # wrap forward pass in autocast for AMP
+            with autocast(enabled=use_amp):
+                if use_mixup:
+                    mixed, oh_a, oh_b, lam = mixup_batch(images, labels, num_classes, mixup_alpha)
+                    outputs  = model(mixed)
+                    log_prob = torch.log_softmax(outputs, dim=1)
+                    loss     = -(lam * (oh_a * log_prob).sum(1) +
+                                 (1 - lam) * (oh_b * log_prob).sum(1)).mean()
+                else:
+                    outputs = model(images)
+                    loss    = criterion(outputs, labels)
 
-        train_loss = running_loss / total
-        train_acc = correct / total
+            # scale loss, unscale before grad clip, then step
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+
+            run_loss += loss.item() * labels.size(0)
+            correct  += (outputs.argmax(1) == labels).sum().item()
+            total    += labels.size(0)
+
+        train_loss = run_loss / total
+        train_acc  = correct  / total
+
+        # Use evaluate_model (single forward pass) for per-epoch validation.
+        # evaluate_with_tta is expensive (5× forward passes + augmentation) and should
+        # only be called ONCE on the test set after training completes.
         val_loss, val_acc = evaluate_model(model, val_loader, criterion, device)
 
         if scheduler is not None:
-            if isinstance(scheduler, ReduceLROnPlateau):
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
+            scheduler.step()
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-        history["lr"].append(current_lr)
+        lr = optimizer.param_groups[0]["lr"]
+        for k, v in zip(
+            ("train_loss", "train_acc", "val_loss", "val_acc", "lr"),
+            (train_loss,   train_acc,   val_loss,   val_acc,   lr),
+        ):
+            history[k].append(v)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_epoch = epoch + 1
-            best_state = copy.deepcopy(model.state_dict())
-            stale_epochs = 0
+            best_epoch   = epoch + 1
+            best_state   = copy.deepcopy(model.state_dict())
+            stale        = 0
         else:
-            stale_epochs += 1
+            stale += 1
 
         print(
-            f"Epoch {epoch + 1}/{epochs} | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "
-            f"LR: {current_lr:.6f}"
+            f"Epoch {epoch+1:>3}/{epochs} | "
+            f"Train Loss: {train_loss:.4f}  Acc: {train_acc:.4f} | "
+            f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f} | "
+            f"LR: {lr:.2e}"
         )
 
-        if patience is not None and stale_epochs >= patience:
-            print(f"Early stopping triggered after epoch {epoch + 1}.")
+        if patience and stale >= patience:
+            print(f"Early stopping at epoch {epoch+1}.")
             break
 
     model.load_state_dict(best_state)
     history["best_val_acc"] = best_val_acc
-    history["best_epoch"] = best_epoch
+    history["best_epoch"]   = best_epoch
+    print(f"\nBest val accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
     return history
 
 
-def predict_with_confidence(model, loader, idx_to_class, device: torch.device, max_examples: int = 5):
+def predict_with_confidence(model, loader, idx_to_class, device, max_examples=5):
     model.eval()
     shown = 0
-
     with torch.no_grad():
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            outputs = model(images)
-            probs = torch.softmax(outputs, dim=1)
-            confidences, preds = probs.max(dim=1)
-
+            images, labels = images.to(device), labels.to(device)
+            probs          = torch.softmax(model(images), dim=1)
+            confs, preds   = probs.max(dim=1)
             for i in range(images.size(0)):
                 print(
-                    f"True: {idx_to_class[labels[i].item()]} | "
-                    f"Predicted: {idx_to_class[preds[i].item()]} | "
-                    f"Confidence: {confidences[i].item():.4f}"
+                    f"True: {idx_to_class[labels[i].item()]:8s} | "
+                    f"Predicted: {idx_to_class[preds[i].item()]:8s} | "
+                    f"Confidence: {confs[i].item():.4f}"
                 )
                 shown += 1
                 if shown >= max_examples:
                     return probs
-
     return probs
