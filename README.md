@@ -6,7 +6,7 @@ This project focuses on facial emotion recognition using grayscale image data wi
 The repository currently contains:
 - [data_preprocessing.ipynb] for dataset loading, augmentation, sanity checks, class imbalance analysis, and dataloader setup
 - [modeling_cnn.ipynb]for the baseline CNN and improved CNN experiments
-- [high_accuracy_modeling.ipynb]for the stronger transfer-learning pipeline
+- [high_accuracy_modeling_v2.py]for the stronger transfer-learning pipeline
 - [emotion_modeling_utils.py]for shared training, evaluation, and dataloader utilities
 
 ## Dataset Summary
