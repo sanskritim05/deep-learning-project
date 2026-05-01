@@ -177,9 +177,9 @@ This project explicitly addresses ethical risks in facial emotion recognition:
 
 ## Recommended Run Order
 
-1. `data_preprocessing.ipynb` – verify loading, augmentation, and class distribution
-2. `high_accuracy_modeling_v2.py` – main transfer learning pipeline (best results)
-3. `modeling_cnn.ipynb` – baseline and improved CNN comparison (for ablation study)
+1. `data_preprocessing.ipynb` - verify loading, augmentation, and class distribution
+2. `high_accuracy_modeling_v2.py` - main transfer learning pipeline (best results)
+3. `modeling_cnn.ipynb` - baseline and improved CNN comparison (for ablation study)
 
 ---
 
